@@ -1,7 +1,8 @@
+# services/docsLoader.py
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from app.db.pinecone_db import get_pinecone
-from services.embeddings import generate_embedding  
+from services.embeddings import generate_embedding_docs
 import uuid
 from datetime import datetime
 
@@ -34,13 +35,12 @@ def store_docs_in_pinecone(user_id: str, file_path: str):
     docs = docs_loader(file_path)
     chunks = split_docs(docs)
 
+    texts = [chunk.page_content for chunk in chunks]
+    embeddings = generate_embedding_docs(texts)
+
     vectors = []
-    for i, chunk in enumerate(chunks):
-        embedding = generate_embedding(chunk.page_content)
-
-        # Unique ID for each chunk
+    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
         chunk_id = str(uuid.uuid4())
-
         vectors.append((
             chunk_id,
             embedding,
@@ -53,7 +53,6 @@ def store_docs_in_pinecone(user_id: str, file_path: str):
             }
         ))
 
-   
     index.upsert(vectors=vectors, namespace=user_id)
 
     return {"message": f"✅ Stored {len(chunks)} chunks for {file_path}"}

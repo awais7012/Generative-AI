@@ -1,17 +1,12 @@
-from sentence_transformers import SentenceTransformer
-from typing import List
+# services/embeddings.py
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
-class HuggingFaceEmbedding:
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        self.model = SentenceTransformer(model_name)
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-    def generate(self, text: str) -> List[float]:
-        """Generate embedding for a single text string"""
-        return self.model.encode(text).tolist()
+def generate_embedding_query(query: str):
+    """Embed a user query."""
+    return embeddings.embed_query(query)
 
-    def batch_generate(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for a list of texts"""
-        return self.model.encode(texts).tolist()
-
-
-embedding_service = HuggingFaceEmbedding()
+def generate_embedding_docs(docs: list[str]):
+    """Embed multiple document chunks."""
+    return embeddings.embed_documents(docs)
