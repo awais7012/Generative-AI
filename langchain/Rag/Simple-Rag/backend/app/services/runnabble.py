@@ -10,7 +10,6 @@ import tiktoken
 
 load_dotenv()
 
-# Initialize LLM
 llm = ChatGroq(
     model="llama-3.3-70b-versatile", 
     temperature=0.7,
@@ -25,7 +24,7 @@ def count_tokens(text: str) -> int:
         encoding = tiktoken.get_encoding("cl100k_base")
         return len(encoding.encode(text))
     except:
-        return len(text.split()) * 1.3  # Rough estimate
+        return len(text.split()) * 1.3  
 
 def create_rag_pipeline():
     """Create multi-user RAG pipeline"""
@@ -83,13 +82,13 @@ def create_rag_pipeline():
             "tokens_used": total_tokens
         }
     
-    # Create pipeline
+    # Creatingggggggg pipeline
     pipeline = (
         RunnableLambda(enhance_prompt) |
         RunnableLambda(lambda enhanced: {
             "enhanced_prompt": enhanced,
-            "user_id": None,  # Will be set by query function
-            "chat_id": None   # Will be set by query function
+            "user_id": None,  
+            "chat_id": None   #
         }) |
         RunnableLambda(get_context) |
         RunnableLambda(generate_answer)
@@ -97,13 +96,13 @@ def create_rag_pipeline():
     
     return pipeline
 
-# Main query function
+
 def query_rag_system(user_id: str, chat_id: str, prompt: str):
     """Main function to query RAG system"""
     try:
         pipeline = create_rag_pipeline()
         
-        # Set user context
+        
         input_data = {
             "prompt": prompt,
             "user_id": user_id,
