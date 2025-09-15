@@ -1,4 +1,4 @@
-# backend/main.py
+# backend/main.py - Working version without Clerk for testing
 from fastapi import FastAPI, Depends, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -6,38 +6,193 @@ import uuid
 import json
 from datetime import datetime
 
-# Import from your middleware modules
-from app.middleware.auth import get_clerk_identity, determine_user_identity
-from app.middleware.token import (
-    get_db, 
-    create_or_get_user, 
-    create_or_get_chat,
-    check_user_token_limits,
-    check_chat_token_limits,
-    extract_chat_id_from_body,
-    calculate_remaining_tokens,
-    update_user_tokens,
-    update_chat_tokens
-)
+# For now, let's use simplified imports to avoid Clerk issues
+# from app.middleware.auth import get_clerk_identity, determine_user_identity
+# from app.middleware.token import (
+#     get_db, create_or_get_user, create_or_get_chat,
+#     check_user_token_limits, check_chat_token_limits,
+#     extract_chat_id_from_body, calculate_remaining_tokens,
+#     update_user_tokens, update_chat_tokens
+# )
 
-# Mock RAG pipeline for testing - replace with your actual imports
+# Simplified mock implementations for testing
+class MockDB:
+    def __init__(self):
+        self.users_data = {}
+        self.chats_data = {}
+        
+    @property
+    def users(self):
+        return self
+        
+    @property  
+    def chats(self):
+        return self
+    
+    def find_one(self, query):
+        if "user_id" in query and "chat_id" not in query:
+            return self.users_data.get(query["user_id"])
+        elif "user_id" in query and "chat_id" in query:
+            key = f"{query['user_id']}:{query['chat_id']}"
+            return self.chats_data.get(key)
+        return None
+    
+    def insert_one(self, doc):
+        if "chat_id" in doc:
+            key = f"{doc['user_id']}:{doc['chat_id']}"
+            self.chats_data[key] = doc
+        else:
+            self.users_data[doc["user_id"]] = doc
+        return type('Result', (), {'inserted_id': True})()
+    
+    def update_one(self, query, update):
+        # Mock update logic
+        if "$inc" in update:
+            if "user_id" in query and "chat_id" not in query:
+                user = self.users_data.get(query["user_id"])
+                if user:
+                    for field, value in update["$inc"].items():
+                        user[field] = user.get(field, 0) + value
+            elif "user_id" in query and "chat_id" in query:
+                key = f"{query['user_id']}:{query['chat_id']}"
+                chat = self.chats_data.get(key)
+                if chat:
+                    for field, value in update["$inc"].items():
+                        chat[field] = chat.get(field, 0) + value
+        return type('Result', (), {'modified_count': 1})()
+
+# Global mock database
+mock_db = MockDB()
+
+def get_db():
+    return mock_db
+
+def get_user_identity(request: Request) -> tuple:
+    """Extract user identity from request headers"""
+    guest_id = request.headers.get("X-Guest-ID")
+    if not guest_id:
+        guest_id = f"guest_{uuid.uuid4().hex[:12]}"
+    
+    return (
+        guest_id,           # user_id
+        True,              # is_guest
+        f"{guest_id}@guest.local",  # email
+        f"Guest_{guest_id[-8:]}",   # username
+        guest_id           # guest_id_for_header
+    )
+
+def create_or_get_user(db, user_id: str, username: str, email: str, is_guest: bool) -> dict:
+    """Get existing user or create new user"""
+    user = db.find_one({"user_id": user_id})
+    if not user:
+        user = {
+            "user_id": user_id,
+            "username": username,
+            "email": email,
+            "tokensUsed": 0,
+            "isGuest": is_guest,
+            "guestTokenLimit": 3000,
+            "isPaidUser": False,
+            "created_at": datetime.utcnow()
+        }
+        db.insert_one(user)
+    return user
+
+def create_or_get_chat(db, user_id: str, chat_id: str) -> dict:
+    """Get existing chat or create new chat"""
+    chat = db.find_one({"user_id": user_id, "chat_id": chat_id})
+    if not chat:
+        chat = {
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "title": "New Chat",
+            "chatTokensUsed": 0,
+            "chatTokenLimit": 30000,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        db.insert_one(chat)
+    return chat
+
+def check_user_token_limits(user: dict):
+    """Check user token limits"""
+    current_tokens = user.get("tokensUsed", 0)
+    if user.get("isGuest", True):
+        token_limit = user.get("guestTokenLimit", 3000)
+        if current_tokens >= token_limit:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "Guest token limit exceeded",
+                    "message": "You've used all your free tokens. Please sign up to continue!",
+                    "tokens_used": current_tokens,
+                    "token_limit": token_limit,
+                    "requires_login": True
+                }
+            )
+
+def check_chat_token_limits(chat: dict):
+    """Check chat token limits"""
+    chat_tokens = chat.get("chatTokensUsed", 0)
+    chat_limit = chat.get("chatTokenLimit", 30000)
+    if chat_tokens >= chat_limit:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "Chat token limit exceeded",
+                "message": "This conversation has reached its limit. Please start a new chat.",
+                "chat_tokens_used": chat_tokens,
+                "chat_token_limit": chat_limit,
+                "requires_new_chat": True
+            }
+        )
+
+async def extract_chat_id_from_body(request: Request) -> str:
+    """Extract chat_id from request body"""
+    try:
+        body = await request.body()
+        if body:
+            request_data = json.loads(body.decode())
+            chat_id = request_data.get("chat_id")
+            if chat_id:
+                return chat_id
+    except Exception as e:
+        print(f"Error parsing request body: {e}")
+    
+    raise HTTPException(status_code=400, detail="Missing chat_id in request body")
+
+def update_user_tokens(user_id: str, tokens_used: int):
+    """Update user tokens"""
+    db = get_db()
+    db.update_one({"user_id": user_id}, {"$inc": {"tokensUsed": tokens_used}})
+    print(f"Updated user {user_id} tokens: +{tokens_used}")
+
+def update_chat_tokens(user_id: str, chat_id: str, tokens_used: int):
+    """Update chat tokens"""
+    db = get_db()
+    db.update_one(
+        {"user_id": user_id, "chat_id": chat_id}, 
+        {"$inc": {"chatTokensUsed": tokens_used}}
+    )
+    print(f"Updated chat {chat_id} tokens: +{tokens_used}")
+
 def query_rag_system(user_id: str, chat_id: str, prompt: str):
-    """Mock RAG system - replace with your actual RAG pipeline"""
+    """Mock RAG system"""
     return {
-        "answer": f"🤖 Mock response for: '{prompt}' (User: {user_id}, Chat: {chat_id})",
-        "tokens_used": len(prompt.split()) * 3  # Mock token calculation
+        "answer": f"🤖 Mock response for: '{prompt}'\n\nUser: {user_id}\nChat: {chat_id}",
+        "tokens_used": len(prompt.split()) * 3
     }
 
+# FastAPI app
 app = FastAPI(
     title="Multi-User RAG API", 
     version="1.0.0",
     description="RAG system with user authentication and token limits"
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure properly for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,45 +206,33 @@ class RagRequest(BaseModel):
 class ChatCreateRequest(BaseModel):
     title: str = "New Chat"
 
-# Main middleware dependency
-async def check_user_and_limits(
-    request: Request,
-    response: Response,
-    identity: dict = Depends(get_clerk_identity),
-    db = Depends(get_db),
-):
-    """
-    Comprehensive middleware that handles:
-    1. User authentication (Clerk + Guest)
-    2. User creation/retrieval  
-    3. Token limit checking
-    4. Chat creation/retrieval
-    5. Chat limit checking
-    """
+# Middleware
+async def check_user_and_limits(request: Request, response: Response, db = Depends(get_db)):
+    """Main middleware for user and token management"""
     
-    # Step 1: Determine user identity
-    user_id, is_guest, email, username, guest_id_for_header = determine_user_identity(request, identity)
+    # Get user identity
+    user_id, is_guest, email, username, guest_id_for_header = get_user_identity(request)
     
-    # Step 2: Set guest ID in response header if needed
+    # Set guest ID in response header
     if guest_id_for_header:
         response.headers["X-Guest-ID"] = guest_id_for_header
     
-    # Step 3: Get or create user in database
+    # Get or create user
     user = create_or_get_user(db, user_id, username, email, is_guest)
     
-    # Step 4: Check user token limits
+    # Check user token limits
     check_user_token_limits(user)
     
-    # Step 5: Extract chat_id from request body
+    # Extract chat_id from request body
     chat_id = await extract_chat_id_from_body(request)
     
-    # Step 6: Get or create chat record
+    # Get or create chat
     chat = create_or_get_chat(db, user_id, chat_id)
     
-    # Step 7: Check chat token limits
+    # Check chat token limits
     check_chat_token_limits(chat)
     
-    # Step 8: Store everything in request state for downstream handlers
+    # Store in request state
     request.state.user = user
     request.state.chat = chat
     request.state.is_guest = is_guest
@@ -101,7 +244,6 @@ async def check_user_and_limits(
 # Routes
 @app.get("/")
 async def root():
-    """Health check endpoint"""
     return {
         "message": "🚀 Multi-User RAG API is running!",
         "status": "healthy",
@@ -116,49 +258,28 @@ async def rag_query(
     body: RagRequest,
     limits_ok = Depends(check_user_and_limits)
 ):
-    """
-    Main RAG query endpoint with comprehensive protection
-    """
-    # Get data from request state (set by middleware)
+    """Main RAG query endpoint"""
     user = request.state.user
     chat = request.state.chat
-    is_guest = request.state.is_guest
-    user_id = request.state.user_id
-    chat_id = request.state.chat_id
     
-    try:
-        # Call RAG pipeline
-        result = query_rag_system(user_id=user_id, chat_id=chat_id, prompt=body.prompt)
-        tokens_used = result.get("tokens_used", 0)
-        
-        # Update token usage in database
-        update_user_tokens(user_id, tokens_used)
-        update_chat_tokens(user_id, chat_id, tokens_used)
-        
-        # Calculate remaining tokens
-        remaining_tokens = calculate_remaining_tokens(user, chat)
-        
-        # Prepare response
-        response_data = {
-            "success": True,
-            "answer": result["answer"],
-            "tokens_used": tokens_used,
-            "user_id": user_id,
-            "chat_id": chat_id,
-            "is_guest": is_guest,
-            **remaining_tokens
-        }
-        
-        return response_data
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "Processing failed",
-                "message": f"Error processing request: {str(e)}"
-            }
-        )
+    # Process request
+    result = query_rag_system(user["user_id"], chat["chat_id"], body.prompt)
+    tokens_used = result["tokens_used"]
+    
+    # Update token counts
+    update_user_tokens(user["user_id"], tokens_used)
+    update_chat_tokens(user["user_id"], chat["chat_id"], tokens_used)
+    
+    return {
+        "success": True,
+        "answer": result["answer"],
+        "tokens_used": tokens_used,
+        "user_id": user["user_id"],
+        "chat_id": chat["chat_id"],
+        "is_guest": user["isGuest"],
+        "user_tokens_remaining": user["guestTokenLimit"] - user["tokensUsed"] - tokens_used,
+        "chat_tokens_remaining": chat["chatTokenLimit"] - chat["chatTokensUsed"] - tokens_used
+    }
 
 @app.get("/api/user/status")
 async def get_user_status(
@@ -166,22 +287,18 @@ async def get_user_status(
     response: Response,
     limits_ok = Depends(check_user_and_limits)
 ):
-    """Get current user status and token usage"""
+    """Get user status"""
     user = request.state.user
     chat = request.state.chat
-    is_guest = request.state.is_guest
-    
-    remaining_tokens = calculate_remaining_tokens(user, chat)
     
     return {
         "user_id": user["user_id"],
-        "username": user.get("username", ""),
-        "email": user.get("email", ""),
-        "is_guest": is_guest,
-        "is_paid_user": user.get("isPaidUser", False),
-        "tokens_used": user.get("tokensUsed", 0),
-        "chat_tokens_used": chat.get("chatTokensUsed", 0),
-        **remaining_tokens,
+        "username": user["username"],
+        "is_guest": user["isGuest"],
+        "tokens_used": user["tokensUsed"],
+        "token_limit": user["guestTokenLimit"],
+        "chat_tokens_used": chat["chatTokensUsed"],
+        "chat_token_limit": chat["chatTokenLimit"],
         "current_chat_id": chat["chat_id"]
     }
 
@@ -190,25 +307,19 @@ async def create_new_chat(
     request: Request,
     response: Response,
     body: ChatCreateRequest = ChatCreateRequest(),
-    identity: dict = Depends(get_clerk_identity),
     db = Depends(get_db)
 ):
-    """Create a new chat for the user"""
+    """Create new chat"""
+    user_id, is_guest, email, username, guest_id_for_header = get_user_identity(request)
     
-    # Determine user identity
-    user_id, is_guest, email, username, guest_id_for_header = determine_user_identity(request, identity)
-    
-    # Set guest ID in response header if needed
     if guest_id_for_header:
         response.headers["X-Guest-ID"] = guest_id_for_header
     
-    # Ensure user exists in database
-    user = create_or_get_user(db, user_id, username, email, is_guest)
+    # Ensure user exists
+    create_or_get_user(db, user_id, username, email, is_guest)
     
-    # Generate new chat ID
+    # Create new chat
     chat_id = f"chat_{uuid.uuid4().hex[:12]}"
-    
-    # Create chat record
     new_chat = {
         "user_id": user_id,
         "chat_id": chat_id,
@@ -218,82 +329,14 @@ async def create_new_chat(
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow()
     }
-    
-    db.chats.insert_one(new_chat)
+    db.insert_one(new_chat)
     
     return {
         "success": True,
         "chat_id": chat_id,
         "title": body.title,
         "user_id": user_id,
-        "is_guest": is_guest,
-        "message": "New chat created successfully"
-    }
-
-@app.get("/api/user/chats")
-async def get_user_chats(
-    request: Request,
-    response: Response,
-    identity: dict = Depends(get_clerk_identity),
-    db = Depends(get_db),
-    limit: int = 20
-):
-    """Get all chats for current user"""
-    
-    # Determine user identity
-    user_id, is_guest, email, username, guest_id_for_header = determine_user_identity(request, identity)
-    
-    # Set guest ID in response header if needed
-    if guest_id_for_header:
-        response.headers["X-Guest-ID"] = guest_id_for_header
-    
-    # Get user chats from database (you'll need to implement this query)
-    # For now, return mock data
-    return {
-        "user_id": user_id,
-        "chats": [
-            {
-                "chat_id": "chat_example123",
-                "title": "Example Chat",
-                "tokens_used": 150,
-                "created_at": datetime.utcnow().isoformat()
-            }
-        ],
-        "total": 1
-    }
-
-@app.delete("/api/chat/{chat_id}")
-async def delete_chat(
-    chat_id: str,
-    request: Request,
-    response: Response,
-    identity: dict = Depends(get_clerk_identity),
-    db = Depends(get_db)
-):
-    """Delete a specific chat"""
-    
-    # Determine user identity
-    user_id, is_guest, email, username, guest_id_for_header = determine_user_identity(request, identity)
-    
-    # Set guest ID in response header if needed
-    if guest_id_for_header:
-        response.headers["X-Guest-ID"] = guest_id_for_header
-    
-    # Delete chat from database (implement this)
-    # For now, return success
-    return {
-        "success": True,
-        "message": f"Chat {chat_id} deleted successfully"
-    }
-
-# Error handlers
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    """Custom error handler for better error responses"""
-    return {
-        "success": False,
-        "error": exc.detail if isinstance(exc.detail, dict) else {"message": exc.detail},
-        "status_code": exc.status_code
+        "is_guest": is_guest
     }
 
 if __name__ == "__main__":

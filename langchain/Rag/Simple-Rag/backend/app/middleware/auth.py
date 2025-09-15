@@ -21,17 +21,20 @@ def get_clerk_identity(credentials: HTTPAuthorizationCredentials = Depends(clerk
     """
     Returns user identity from Clerk JWT or guest info
     """
-    if credentials and credentials.decoded:
-        claims = credentials.decoded
-        user_id = claims.get("sub")
-        if user_id:
-            return {
-                "user_id": user_id, 
-                "claims": claims, 
-                "is_logged_in": True,
-                "email": claims.get("email", ""),
-                "username": claims.get("username", claims.get("name", ""))
-            }
+    try:
+        if credentials and hasattr(credentials, 'decoded') and credentials.decoded:
+            claims = credentials.decoded
+            user_id = claims.get("sub")
+            if user_id:
+                return {
+                    "user_id": user_id, 
+                    "claims": claims, 
+                    "is_logged_in": True,
+                    "email": claims.get("email", ""),
+                    "username": claims.get("username", claims.get("name", ""))
+                }
+    except Exception as e:
+        print(f"Clerk auth error (falling back to guest): {e}")
     
     # Guest user fallback
     return {
